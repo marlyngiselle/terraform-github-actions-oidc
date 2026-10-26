@@ -1,0 +1,29 @@
+# Terraform working directories and local state
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Saved plans can contain sensitive values
+*.tfplan
+tfplan
+tfplan.*
+plan.txt
+
+# Variable files usually hold environment-specific values; commit *.tfvars.example instead
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
