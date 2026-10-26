@@ -1,0 +1,37 @@
+# Copy to .github/workflows/ in the repository that holds your Terraform code.
+# Scheduled runs execute on the default branch, so they use the
+# refs/heads/main subject and the read-only identities.
+name: terraform-drift
+
+on:
+  schedule:
+    - cron: "17 6 * * 1-5" # weekdays, 06:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  azure:
+    uses: ORG/REPO/.github/workflows/terraform-drift.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    with:
+      provider: azure
+      working-directory: infra/azure
+      azure-client-id: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+  aws:
+    uses: ORG/REPO/.github/workflows/terraform-drift.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    with:
+      provider: aws
+      working-directory: infra/aws
+      aws-role-arn: ${{ vars.AWS_PLAN_ROLE_ARN }}
+      aws-region: ${{ vars.AWS_REGION }}

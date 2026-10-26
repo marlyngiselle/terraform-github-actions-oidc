@@ -1,0 +1,54 @@
+# Copy to .github/workflows/ in the repository that holds your Terraform code.
+# Pull requests get a plan comment; a merge to main plans again and applies
+# that exact plan after approval on the "prod" environment.
+name: terraform-azure
+
+on:
+  pull_request:
+    paths:
+      - infra/azure/**
+  push:
+    branches: [main]
+    paths:
+      - infra/azure/**
+
+# Serialize runs per ref. Pull request runs replace each other; runs on main queue.
+concurrency:
+  group: terraform-azure-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  plan:
+    uses: ORG/REPO/.github/workflows/terraform-plan.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    with:
+      provider: azure
+      working-directory: infra/azure
+      # Read-only identity. Its federated credentials trust the pull_request
+      # and refs/heads/main subjects only.
+      azure-client-id: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+  apply:
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.has-changes == 'true'
+    uses: ORG/REPO/.github/workflows/terraform-apply.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      provider: azure
+      working-directory: infra/azure
+      environment: prod
+      plan-artifact: ${{ needs.plan.outputs.plan-artifact }}
+      # Write-capable identity. Its only federated credential trusts
+      # environment:prod, so this ID is useless outside an approved prod job.
+      azure-client-id: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}

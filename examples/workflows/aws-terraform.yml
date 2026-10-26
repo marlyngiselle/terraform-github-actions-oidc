@@ -1,0 +1,47 @@
+# Copy to .github/workflows/ in the repository that holds your Terraform code.
+# Pull requests get a plan comment; a merge to main plans again and applies
+# that exact plan after approval on the "prod" environment.
+name: terraform-aws
+
+on:
+  pull_request:
+    paths:
+      - infra/aws/**
+  push:
+    branches: [main]
+    paths:
+      - infra/aws/**
+
+concurrency:
+  group: terraform-aws-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  plan:
+    uses: ORG/REPO/.github/workflows/terraform-plan.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    with:
+      provider: aws
+      working-directory: infra/aws
+      aws-role-arn: ${{ vars.AWS_PLAN_ROLE_ARN }}
+      aws-region: ${{ vars.AWS_REGION }}
+
+  apply:
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.has-changes == 'true'
+    uses: ORG/REPO/.github/workflows/terraform-apply.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      provider: aws
+      working-directory: infra/aws
+      environment: prod
+      plan-artifact: ${{ needs.plan.outputs.plan-artifact }}
+      aws-role-arn: ${{ vars.AWS_APPLY_ROLE_ARN }}
+      aws-region: ${{ vars.AWS_REGION }}
