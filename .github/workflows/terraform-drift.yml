@@ -1,0 +1,249 @@
+name: terraform-drift
+
+# Reusable workflow: runs a read-only plan on a schedule and keeps one GitHub
+# issue per root module in sync with the result. Drift opens or updates the
+# issue; a clean plan closes it.
+
+on:
+  workflow_call:
+    inputs:
+      provider:
+        description: Cloud provider to authenticate against, "azure" or "aws".
+        type: string
+        required: true
+      working-directory:
+        description: Path of the Terraform root module, relative to the repository root.
+        type: string
+        required: true
+      terraform-version:
+        description: Terraform CLI version to install.
+        type: string
+        default: "1.16.7"
+      backend-config:
+        description: Backend config file passed to terraform init, relative to working-directory. Empty to skip.
+        type: string
+        default: backend.hcl
+      var-file:
+        description: Optional tfvars file, relative to working-directory.
+        type: string
+        default: ""
+      azure-client-id:
+        description: Client ID of the read-only Entra ID application.
+        type: string
+        default: ""
+      azure-tenant-id:
+        description: Entra ID tenant ID.
+        type: string
+        default: ""
+      azure-subscription-id:
+        description: Target Azure subscription ID.
+        type: string
+        default: ""
+      aws-role-arn:
+        description: ARN of the read-only IAM role.
+        type: string
+        default: ""
+      aws-region:
+        description: AWS region for the session.
+        type: string
+        default: ""
+      issue-label:
+        description: Label used to find and tag drift issues.
+        type: string
+        default: drift
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 30
+    outputs:
+      drift-detected:
+        description: '"true" when the plan found differences.'
+        value: ${{ jobs.drift.outputs.drift-detected }}
+
+permissions: {}
+
+jobs:
+  drift:
+    name: drift (${{ inputs.working-directory }})
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      id-token: write # request the OIDC token exchanged for cloud credentials
+      issues: write # open, update and close the drift issue
+    concurrency:
+      group: tf-drift-${{ github.repository }}-${{ inputs.working-directory }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      ARM_USE_OIDC: ${{ inputs.provider == 'azure' }}
+      ARM_USE_AZUREAD: ${{ inputs.provider == 'azure' }}
+      ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
+      ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+      ARM_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+    outputs:
+      drift-detected: ${{ steps.plan.outputs.drift }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        working-directory: .
+        env:
+          PROVIDER: ${{ inputs.provider }}
+          AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+          AZURE_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          AZURE_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+          AWS_ROLE_ARN: ${{ inputs.aws-role-arn }}
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          case "$PROVIDER" in
+            azure) required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID) ;;
+            aws)   required=(AWS_ROLE_ARN AWS_REGION) ;;
+            *)     echo "::error::provider must be 'azure' or 'aws', got '$PROVIDER'"; exit 1 ;;
+          esac
+          for name in "${required[@]}"; do
+            [ -n "${!name}" ] || { echo "::error::input for $name is required when provider is $PROVIDER"; exit 1; }
+          done
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        if: inputs.provider == 'azure'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: AWS credentials (OIDC)
+        if: inputs.provider == 'aws'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: tf-drift-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: terraform init
+        env:
+          BACKEND_CONFIG: ${{ inputs.backend-config }}
+        run: |
+          args=()
+          [ -n "$BACKEND_CONFIG" ] && args+=("-backend-config=$BACKEND_CONFIG")
+          terraform init -input=false "${args[@]}"
+
+      # -lock=false: a drift check never writes state, so it must not block a
+      # pending apply that holds the lock.
+      - name: terraform plan
+        id: plan
+        env:
+          VAR_FILE: ${{ inputs.var-file }}
+        run: |
+          args=()
+          [ -n "$VAR_FILE" ] && args+=("-var-file=$VAR_FILE")
+          set +e
+          terraform plan -input=false -no-color -lock=false -detailed-exitcode "${args[@]}" > plan.txt 2>&1
+          code=$?
+          set -e
+          cat plan.txt
+          case "$code" in
+            0) echo "drift=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "drift=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::terraform plan failed with exit code $code"; exit "$code" ;;
+          esac
+
+      - name: Sync drift issue
+        uses: actions/github-script@v9
+        env:
+          WORKING_DIR: ${{ inputs.working-directory }}
+          LABEL: ${{ inputs.issue-label }}
+          DRIFT: ${{ steps.plan.outputs.drift }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const dir = process.env.WORKING_DIR;
+            const label = process.env.LABEL;
+            const title = `Terraform drift detected in ${dir}`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            });
+            const existing = issues.find((i) => i.title === title && !i.pull_request);
+
+            if (process.env.DRIFT !== 'true') {
+              core.summary.addRaw(`No drift in \`${dir}\`.`);
+              await core.summary.write();
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `The infrastructure matches the code again ([run](${runUrl})). Closing.`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number, state: 'closed', state_reason: 'completed',
+                });
+              }
+              return;
+            }
+
+            const plan = fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, dir, 'plan.txt'), 'utf8');
+            const max = 60000;
+            const excerpt = plan.length > max ? plan.slice(0, max) + '\n\n... truncated, see the run log.' : plan;
+            const summaryLine = (plan.match(/^Plan: .*$/m) || ['Differences detected'])[0];
+            const body = [
+              `The scheduled plan for \`${dir}\` no longer matches the deployed infrastructure.`,
+              '',
+              `**${summaryLine}**`,
+              '',
+              `Last checked by [this run](${runUrl}) on commit \`${context.sha.slice(0, 7)}\`.`,
+              '',
+              'Either bring the code in line with the change (and open a pull request), or re-apply the code to revert the manual change.',
+              '',
+              '<details><summary>Plan output</summary>',
+              '',
+              '```terraform',
+              excerpt,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            core.summary.addRaw(`Drift detected in \`${dir}\`: ${summaryLine}`);
+            await core.summary.write();
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'd93f0b',
+                description: 'Deployed infrastructure differs from Terraform code',
+              });
+            }
+
+            if (existing) {
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `Drift still present: ${summaryLine} ([run](${runUrl})).`,
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+            }

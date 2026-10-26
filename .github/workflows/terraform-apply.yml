@@ -1,0 +1,186 @@
+name: terraform-apply
+
+# Reusable workflow: applies the exact plan produced by terraform-plan.yml in
+# the same run. The job is bound to a GitHub Environment, so required reviewers
+# approve before the OIDC token (and therefore the cloud session) even exists.
+
+on:
+  workflow_call:
+    inputs:
+      provider:
+        description: Cloud provider to authenticate against, "azure" or "aws".
+        type: string
+        required: true
+      working-directory:
+        description: Path of the Terraform root module, relative to the repository root.
+        type: string
+        required: true
+      environment:
+        description: GitHub Environment that gates the apply. Configure required reviewers on it.
+        type: string
+        required: true
+      plan-artifact:
+        description: Artifact name returned by terraform-plan.yml (output plan-artifact).
+        type: string
+        required: true
+      terraform-version:
+        description: Terraform CLI version. Must match the version that produced the plan.
+        type: string
+        default: "1.16.7"
+      backend-config:
+        description: Backend config file passed to terraform init, relative to working-directory. Empty to skip.
+        type: string
+        default: backend.hcl
+      azure-client-id:
+        description: Client ID of the Entra ID application trusted for the environment subject.
+        type: string
+        default: ""
+      azure-tenant-id:
+        description: Entra ID tenant ID.
+        type: string
+        default: ""
+      azure-subscription-id:
+        description: Target Azure subscription ID.
+        type: string
+        default: ""
+      aws-role-arn:
+        description: ARN of the IAM role trusted for the environment subject.
+        type: string
+        default: ""
+      aws-region:
+        description: AWS region for the session.
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 60
+
+permissions: {}
+
+jobs:
+  apply:
+    name: apply (${{ inputs.working-directory }} to ${{ inputs.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # request the OIDC token exchanged for cloud credentials
+    # One apply per state at a time, and never cancel one that is running.
+    concurrency:
+      group: tf-apply-${{ github.repository }}-${{ inputs.environment }}-${{ inputs.working-directory }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      ARM_USE_OIDC: ${{ inputs.provider == 'azure' }}
+      ARM_USE_AZUREAD: ${{ inputs.provider == 'azure' }}
+      ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
+      ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+      ARM_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        working-directory: .
+        env:
+          PROVIDER: ${{ inputs.provider }}
+          AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+          AZURE_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          AZURE_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+          AWS_ROLE_ARN: ${{ inputs.aws-role-arn }}
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] || [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
+            echo "::error::apply must not run from a pull request event"; exit 1
+          fi
+          case "$PROVIDER" in
+            azure) required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID) ;;
+            aws)   required=(AWS_ROLE_ARN AWS_REGION) ;;
+            *)     echo "::error::provider must be 'azure' or 'aws', got '$PROVIDER'"; exit 1 ;;
+          esac
+          for name in "${required[@]}"; do
+            [ -n "${!name}" ] || { echo "::error::input for $name is required when provider is $PROVIDER"; exit 1; }
+          done
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.plan-artifact }}
+          path: ${{ inputs.working-directory }}
+
+      # The plan must belong to the commit being deployed and must not have
+      # been altered since the plan job produced it.
+      - name: Verify plan integrity
+        run: |
+          planned_commit=$(jq -r .commit plan-metadata.json)
+          if [ "$planned_commit" != "$GITHUB_SHA" ]; then
+            echo "::error::plan was created for $planned_commit but this run is deploying $GITHUB_SHA"; exit 1
+          fi
+          echo "$(jq -r .plan_sha256 plan-metadata.json)  tfplan" | sha256sum --check --strict
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        if: inputs.provider == 'azure'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: AWS credentials (OIDC)
+        if: inputs.provider == 'aws'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: tf-apply-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # -lockfile=readonly installs exactly the provider builds recorded at plan time.
+      - name: terraform init
+        env:
+          BACKEND_CONFIG: ${{ inputs.backend-config }}
+        run: |
+          args=()
+          [ -n "$BACKEND_CONFIG" ] && args+=("-backend-config=$BACKEND_CONFIG")
+          terraform init -input=false -lockfile=readonly "${args[@]}"
+
+      # Applying a saved plan never prompts and fails if the state moved since the plan.
+      - name: terraform apply
+        run: |
+          set -o pipefail
+          terraform apply -input=false -no-color -lock-timeout=5m tfplan 2>&1 | tee apply.log
+
+      - name: Report apply
+        if: always()
+        env:
+          WORKING_DIR: ${{ inputs.working-directory }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Terraform apply for \`$WORKING_DIR\` to \`$ENVIRONMENT\`: $JOB_STATUS"
+            echo
+            if [ -f apply.log ]; then
+              echo '```terraform'
+              tail -n 50 apply.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,340 @@
+name: terraform-plan
+
+# Reusable workflow: static checks, then a saved plan that the apply workflow
+# consumes byte for byte. Authenticates to Azure or AWS through GitHub OIDC,
+# so callers pass identifiers, never secrets.
+
+on:
+  workflow_call:
+    inputs:
+      provider:
+        description: Cloud provider to authenticate against, "azure" or "aws".
+        type: string
+        required: true
+      working-directory:
+        description: Path of the Terraform root module, relative to the repository root.
+        type: string
+        required: true
+      terraform-version:
+        description: Terraform CLI version to install.
+        type: string
+        default: "1.16.7"
+      backend-config:
+        description: Backend config file passed to terraform init, relative to working-directory. Empty to skip.
+        type: string
+        default: backend.hcl
+      var-file:
+        description: Optional tfvars file, relative to working-directory.
+        type: string
+        default: ""
+      azure-client-id:
+        description: Client ID of the Entra ID application trusted for this workflow's subject.
+        type: string
+        default: ""
+      azure-tenant-id:
+        description: Entra ID tenant ID.
+        type: string
+        default: ""
+      azure-subscription-id:
+        description: Target Azure subscription ID.
+        type: string
+        default: ""
+      aws-role-arn:
+        description: ARN of the IAM role trusted for this workflow's subject.
+        type: string
+        default: ""
+      aws-region:
+        description: AWS region for the session.
+        type: string
+        default: ""
+      tflint-config:
+        description: TFLint config file, relative to the repository root. Skipped when the file does not exist.
+        type: string
+        default: .tflint.hcl
+      checkov-skip-checks:
+        description: Comma-separated Checkov check IDs to skip.
+        type: string
+        default: ""
+      checkov-soft-fail:
+        description: Report Checkov findings without failing the job.
+        type: boolean
+        default: false
+      artifact-retention-days:
+        description: Days to keep the plan artifact. Plans can contain sensitive values, keep this short.
+        type: number
+        default: 5
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 30
+    outputs:
+      has-changes:
+        description: '"true" when the plan contains changes.'
+        value: ${{ jobs.plan.outputs.has-changes }}
+      plan-artifact:
+        description: Name of the uploaded plan artifact, empty when there are no changes.
+        value: ${{ jobs.plan.outputs.plan-artifact }}
+      plan-exitcode:
+        description: Exit code of terraform plan -detailed-exitcode (0 no changes, 2 changes).
+        value: ${{ jobs.plan.outputs.plan-exitcode }}
+
+permissions: {}
+
+jobs:
+  plan:
+    name: plan (${{ inputs.working-directory }})
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      id-token: write # request the OIDC token exchanged for cloud credentials
+      pull-requests: write # sticky plan comment on pull requests
+    concurrency:
+      group: tf-plan-${{ github.repository }}-${{ inputs.working-directory }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+      # azurerm provider and backend read these; OIDC replaces any client secret.
+      ARM_USE_OIDC: ${{ inputs.provider == 'azure' }}
+      ARM_USE_AZUREAD: ${{ inputs.provider == 'azure' }}
+      ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
+      ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+      ARM_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+    outputs:
+      has-changes: ${{ steps.plan.outputs.has-changes }}
+      plan-artifact: ${{ steps.package.outputs.name }}
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        working-directory: .
+        env:
+          PROVIDER: ${{ inputs.provider }}
+          WORKING_DIR: ${{ inputs.working-directory }}
+          AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+          AZURE_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          AZURE_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+          AWS_ROLE_ARN: ${{ inputs.aws-role-arn }}
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          [ -d "$WORKING_DIR" ] || { echo "::error::working-directory '$WORKING_DIR' does not exist"; exit 1; }
+          case "$PROVIDER" in
+            azure) required=(AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID) ;;
+            aws)   required=(AWS_ROLE_ARN AWS_REGION) ;;
+            *)     echo "::error::provider must be 'azure' or 'aws', got '$PROVIDER'"; exit 1 ;;
+          esac
+          for name in "${required[@]}"; do
+            [ -n "${!name}" ] || { echo "::error::input for $name is required when provider is $PROVIDER"; exit 1; }
+          done
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      # Static checks run before any credential exists in the job.
+      - name: terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.65.0
+
+      - name: tflint
+        id: tflint
+        env:
+          TFLINT_CONFIG: ${{ github.workspace }}/${{ inputs.tflint-config }}
+          GITHUB_TOKEN: ${{ github.token }} # avoids API rate limits while downloading plugins
+        run: |
+          args=()
+          [ -f "$TFLINT_CONFIG" ] && args+=(--config "$TFLINT_CONFIG")
+          tflint --init "${args[@]}"
+          tflint --format compact "${args[@]}"
+
+      - name: checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.working-directory }}
+          framework: terraform
+          skip_check: ${{ inputs.checkov-skip-checks }}
+          soft_fail: ${{ inputs.checkov-soft-fail }}
+          quiet: true
+          compact: true
+          output_format: cli
+
+      - name: Azure login (OIDC)
+        if: inputs.provider == 'azure'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: AWS credentials (OIDC)
+        if: inputs.provider == 'aws'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: tf-plan-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: terraform init
+        id: init
+        env:
+          BACKEND_CONFIG: ${{ inputs.backend-config }}
+        run: |
+          args=()
+          [ -n "$BACKEND_CONFIG" ] && args+=("-backend-config=$BACKEND_CONFIG")
+          terraform init -input=false "${args[@]}"
+
+      - name: terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        env:
+          VAR_FILE: ${{ inputs.var-file }}
+        run: |
+          args=()
+          [ -n "$VAR_FILE" ] && args+=("-var-file=$VAR_FILE")
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan "${args[@]}" 2>&1 | tee plan.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0) echo "has-changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has-changes=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$code" ;;
+          esac
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Package plan
+        id: package
+        if: steps.plan.outputs.has-changes == 'true'
+        env:
+          WORKING_DIR: ${{ inputs.working-directory }}
+          TERRAFORM_VERSION: ${{ inputs.terraform-version }}
+        run: |
+          slug=$(printf '%s' "$WORKING_DIR" | tr -c 'A-Za-z0-9_-' '-' | sed 's/^-*//; s/-*$//')
+          name="tfplan-${slug}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg dir "$WORKING_DIR" \
+            --arg tf "$TERRAFORM_VERSION" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg sha256 "$(sha256sum tfplan | cut -d' ' -f1)" \
+            '{commit: $commit, ref: $ref, working_directory: $dir, terraform_version: $tf, run_id: $run, plan_sha256: $sha256}' \
+            > plan-metadata.json
+          cat plan-metadata.json
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        if: steps.plan.outputs.has-changes == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ inputs.working-directory }}/tfplan
+            ${{ inputs.working-directory }}/plan-metadata.json
+            ${{ inputs.working-directory }}/.terraform.lock.hcl
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Report plan
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          WORKING_DIR: ${{ inputs.working-directory }}
+          PROVIDER: ${{ inputs.provider }}
+          FMT: ${{ steps.fmt.outcome }}
+          TFLINT: ${{ steps.tflint.outcome }}
+          CHECKOV: ${{ steps.checkov.outcome }}
+          INIT: ${{ steps.init.outcome }}
+          VALIDATE: ${{ steps.validate.outcome }}
+          PLAN: ${{ steps.plan.outcome }}
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const dir = process.env.WORKING_DIR;
+            const base = path.join(process.env.GITHUB_WORKSPACE, dir);
+            const read = (f) => (fs.existsSync(path.join(base, f)) ? fs.readFileSync(path.join(base, f), 'utf8') : '');
+
+            const output = read('plan.txt') || read('plan.log') || 'Plan did not run. Check the job log.';
+            const summaryLine =
+              (output.match(/^(Plan: .*|No changes\..*)$/m) || [])[0] ||
+              (process.env.PLAN === 'failure' ? 'Plan failed' : 'Plan not executed');
+
+            const max = 60000;
+            const body = output.length > max
+              ? output.slice(0, max) + '\n\n... truncated, see the job log for the full plan.'
+              : output;
+
+            const steps = [
+              ['fmt', process.env.FMT],
+              ['tflint', process.env.TFLINT],
+              ['checkov', process.env.CHECKOV],
+              ['init', process.env.INIT],
+              ['validate', process.env.VALIDATE],
+              ['plan', process.env.PLAN],
+            ];
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const marker = `<!-- terraform-plan:${dir} -->`;
+            const comment = [
+              marker,
+              `### Terraform plan for \`${dir}\` (${process.env.PROVIDER})`,
+              '',
+              '| Step | Outcome |',
+              '| --- | --- |',
+              ...steps.map(([name, outcome]) => `| ${name} | ${outcome || 'skipped'} |`),
+              '',
+              `**${summaryLine}**`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              body,
+              '```',
+              '',
+              '</details>',
+              '',
+              `Commit \`${context.sha.slice(0, 7)}\`, [workflow run](${runUrl}).`,
+            ].join('\n');
+
+            await core.summary.addRaw(comment).write();
+
+            if (context.eventName !== 'pull_request') return;
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const existing = (await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number }))
+              .find((c) => c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: comment });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: comment });
+            }
