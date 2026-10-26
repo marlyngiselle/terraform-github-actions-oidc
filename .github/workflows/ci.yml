@@ -1,0 +1,96 @@
+name: ci
+
+# Self-check for this repository: every Terraform root module and every
+# workflow is linted and validated on each change. No cloud access needed.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  terraform:
+    name: terraform (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - bootstrap/azure
+          - bootstrap/aws
+          - examples/infra/azure
+          - examples/infra/aws
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.7"
+          terraform_wrapper: false
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.65.0
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --format compact --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+  checkov:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          quiet: true
+          compact: true
+          output_format: cli
+
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color .github/workflows/terraform-plan.yml .github/workflows/terraform-apply.yml .github/workflows/terraform-drift.yml .github/workflows/ci.yml examples/workflows/azure-terraform.yml examples/workflows/aws-terraform.yml examples/workflows/drift.yml
