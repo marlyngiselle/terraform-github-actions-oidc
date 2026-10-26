@@ -20,7 +20,7 @@ permissions: {}
 
 jobs:
   plan:
-    uses: ORG/REPO/.github/workflows/terraform-plan.yml@v1
+    uses: marlyngiselle/terraform-github-actions-oidc/.github/workflows/terraform-plan.yml@v1
     permissions:
       contents: read
       id-token: write
@@ -34,7 +34,7 @@ jobs:
   apply:
     needs: plan
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.has-changes == 'true'
-    uses: ORG/REPO/.github/workflows/terraform-apply.yml@v1
+    uses: marlyngiselle/terraform-github-actions-oidc/.github/workflows/terraform-apply.yml@v1
     permissions:
       contents: read
       id-token: write

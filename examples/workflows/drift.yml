@@ -12,7 +12,7 @@ permissions: {}
 
 jobs:
   azure:
-    uses: ORG/REPO/.github/workflows/terraform-drift.yml@v1
+    uses: marlyngiselle/terraform-github-actions-oidc/.github/workflows/terraform-drift.yml@v1
     permissions:
       contents: read
       id-token: write
@@ -25,7 +25,7 @@ jobs:
       azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
   aws:
-    uses: ORG/REPO/.github/workflows/terraform-drift.yml@v1
+    uses: marlyngiselle/terraform-github-actions-oidc/.github/workflows/terraform-drift.yml@v1
     permissions:
       contents: read
       id-token: write
