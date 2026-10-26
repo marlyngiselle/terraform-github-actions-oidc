@@ -1,0 +1,11 @@
+github_owner      = "ORG"
+github_repository = "REPO"
+
+# Scope the apply role to what the workload deploys. Example only.
+apply_policy_arns = ["arn:aws:iam::aws:policy/AmazonS3FullAccess"]
+
+# Optional
+# region               = "eu-west-1"
+# plan_branch          = "main"
+# apply_environment    = "prod"
+# create_oidc_provider = false
